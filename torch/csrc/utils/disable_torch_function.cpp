@@ -1,6 +1,7 @@
 #include <torch/csrc/utils/disable_torch_function.h>
 #include <torch/csrc/utils/pybind.h>
 #include <torch/csrc/Exceptions.h>
+#include <torch/csrc/utils/python_strings.h>
 
 namespace torch {
   static thread_local bool enable_torch_function = true;
@@ -124,4 +125,103 @@ PyObject* THPModule_disable_torch_function(PyObject *self, PyObject *a) {
   torch::enable_torch_function = old_value;
   return result;
   END_HANDLE_TH_ERRORS
+}
+
+// Makes sure that we don't check for __torch_function__ on basic Python types
+static bool _is_basic_python_type(PyTypeObject *tp)
+{
+  return (
+    /* Basic number types */
+    tp == &PyBool_Type ||
+
+    tp == &PyLong_Type ||
+    tp == &PyFloat_Type ||
+    tp == &PyComplex_Type ||
+
+    /* Basic sequence types */
+    tp == &PyList_Type ||
+    tp == &PyTuple_Type ||
+    tp == &PyDict_Type ||
+    tp == &PySet_Type ||
+    tp == &PyFrozenSet_Type ||
+    tp == &PyUnicode_Type ||
+    tp == &PyBytes_Type ||
+
+    /* other builtins */
+    tp == &PySlice_Type ||
+    tp == Py_TYPE(Py_None) ||
+    tp == Py_TYPE(Py_Ellipsis) ||
+    tp == Py_TYPE(Py_NotImplemented) ||
+
+    PyModule_Check(tp) ||
+    /* sentinel to swallow trailing || */
+    false
+  );
+}
+
+inline bool has_torch_function_attr(PyObject* obj) {
+  auto attr = PyObject_GetAttrString(obj, "__torch_function__");
+  return (
+    attr != NULL &&
+    attr != torch::disabled_torch_function);
+}
+
+inline bool sequence_has_torch_function(PyObject* args) {
+  // NB: The caller is expected to guarantee a sequence.
+  if (!torch::torch_function_enabled())
+    return false;
+
+  Py_ssize_t n = PySequence_Fast_GET_SIZE(args);
+  for (Py_ssize_t i = 0; i < n; i++) {
+    PyObject* obj = PySequence_Fast_GET_ITEM(args, i);
+    PyTypeObject *tp = Py_TYPE(obj);
+    if (!THPVariable_CheckExact(tp) &&
+        !_is_basic_python_type(tp) &&
+        has_torch_function_attr(obj))
+      return true;
+  }
+
+  return false;
+}
+
+namespace torch {
+auto check_has_torch_function(PyObject* obj) -> bool
+{
+  PyTypeObject *tp = Py_TYPE(obj);
+  return (
+    !THPVariable_CheckExact(tp) &&
+    !_is_basic_python_type(tp) &&
+    torch::torch_function_enabled() &&
+    PyObject_GetAttrString(obj, "__torch_function__") != torch::disabled_torch_function
+  );
+}
+} // namespace torch
+
+PyObject* THPModule_has_torch_function(PyObject*, PyObject *arg) {
+  if (PyTuple_CheckExact(arg) || PyList_CheckExact(arg)) {
+    // Fast path:
+    //   If we know that we have a tuple or list, we can skip an INCREF and
+    //   DECREF from PySequence_Fast. Core functions will always follow this
+    //   convention (almost always tuples), and it shaves ~3.5% off the cost of
+    //   the check.
+    if (sequence_has_torch_function(arg))
+      Py_RETURN_TRUE;
+    Py_RETURN_FALSE;
+  }
+
+  PyObject* args(PySequence_Fast(arg, "expected a sequence"));
+  auto result = sequence_has_torch_function(args);
+  Py_DECREF(args);
+
+  if (result)
+    Py_RETURN_TRUE;
+  Py_RETURN_FALSE;
+}
+
+PyObject* THPModule_object_has_torch_function(PyObject*, PyObject *obj) {
+  // Special case `THPModule_has_torch_function` for the single arg case.
+  if (torch::check_has_torch_function(obj))
+    Py_RETURN_TRUE;
+
+  Py_RETURN_FALSE;
 }
